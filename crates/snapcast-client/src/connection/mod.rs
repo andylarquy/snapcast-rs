@@ -20,7 +20,9 @@ use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 /// Read a complete frame (header + payload) from an async reader.
 async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<TypedMessage> {
@@ -76,12 +78,47 @@ struct PendingRequest {
 }
 
 /// TCP connection to a snapserver.
+///
+/// The read half is owned exclusively by a background task (spawned in
+/// `connect`) that does nothing but loop on `read_frame` and forward
+/// complete frames over `frame_rx`. This exists because `recv()` used to
+/// read directly off the shared stream and get raced inside
+/// `Controller::receive_loop`'s `tokio::select!` against timer ticks - and
+/// `AsyncReadExt::read_exact` is documented as *not* cancellation-safe: if
+/// a timer branch won the race while a header/payload read was
+/// in-flight, the partially-read bytes were silently dropped, permanently
+/// desyncing the stream's framing (every subsequent header parsed garbage,
+/// surfacing as "payload too large: <huge nonsense value>"). Racing
+/// `frame_rx.recv()` instead is safe: `mpsc::Receiver::recv` is
+/// cancellation-safe, so a lost race here never drops a byte.
 pub struct TcpConnection {
-    stream: Option<TcpStream>,
+    write_half: Option<OwnedWriteHalf>,
+    reader_task: Option<JoinHandle<()>>,
+    frame_rx: Option<mpsc::Receiver<Result<TypedMessage>>>,
     host: String,
     port: u16,
     pending: HashMap<u16, PendingRequest>,
     next_id: u16,
+}
+
+/// Owns the read half exclusively; nothing ever races this loop, so
+/// `read_frame`'s `read_exact` calls always run to completion.
+fn spawn_reader(
+    mut read_half: OwnedReadHalf,
+    tx: mpsc::Sender<Result<TypedMessage>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let result = read_frame(&mut read_half).await;
+            let is_err = result.is_err();
+            if tx.send(result).await.is_err() {
+                return; // receiving side dropped (disconnected)
+            }
+            if is_err {
+                return; // stream is desynced/closed, nothing left to read
+            }
+        }
+    })
 }
 
 /// Unified connection over supported transports.
@@ -157,7 +194,9 @@ impl TcpConnection {
     /// Create a new connection to the given host and port.
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            stream: None,
+            write_half: None,
+            reader_task: None,
+            frame_rx: None,
             host: host.to_string(),
             port,
             pending: HashMap::new(),
@@ -171,7 +210,15 @@ impl TcpConnection {
         let stream = TcpStream::connect(&addr)
             .await
             .with_context(|| format!("connecting to {addr}"))?;
-        self.stream = Some(stream);
+        let (read_half, write_half) = stream.into_split();
+        let (tx, rx) = mpsc::channel(32);
+
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        self.reader_task = Some(spawn_reader(read_half, tx));
+        self.write_half = Some(write_half);
+        self.frame_rx = Some(rx);
         self.pending.clear();
         self.next_id = 1;
         Ok(())
@@ -179,17 +226,21 @@ impl TcpConnection {
 
     /// Close the connection.
     pub fn disconnect(&mut self) {
-        self.stream = None;
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        self.write_half = None;
+        self.frame_rx = None;
         self.pending.clear();
     }
 
-    fn stream_mut(&mut self) -> Result<&mut TcpStream> {
-        self.stream.as_mut().context("not connected")
+    fn write_half_mut(&mut self) -> Result<&mut OwnedWriteHalf> {
+        self.write_half.as_mut().context("not connected")
     }
 
     /// Send a message without waiting for a response.
     pub async fn send(&mut self, msg_type: MessageType, payload: &MessagePayload) -> Result<()> {
-        let stream = self.stream_mut()?;
+        let writer = self.write_half_mut()?;
         let mut base = BaseMessage {
             msg_type,
             id: 0,
@@ -199,7 +250,7 @@ impl TcpConnection {
             size: 0,
         };
         stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await
+        write_frame(writer, &mut base, payload).await
     }
 
     /// Send a request and wait for the response (matched by `refersTo`).
@@ -215,7 +266,7 @@ impl TcpConnection {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(id, PendingRequest { tx });
 
-        let stream = self.stream_mut()?;
+        let writer = self.write_half_mut()?;
         let mut base = BaseMessage {
             msg_type,
             id,
@@ -225,7 +276,7 @@ impl TcpConnection {
             size: 0,
         };
         stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await?;
+        write_frame(writer, &mut base, payload).await?;
 
         tokio::time::timeout(timeout, rx)
             .await
@@ -235,10 +286,20 @@ impl TcpConnection {
 
     /// Receive the next message. If it's a response to a pending request,
     /// deliver it to the waiting caller and receive again.
+    ///
+    /// Pulls already-fully-read frames off `frame_rx` rather than reading
+    /// the socket directly - safe to race in a `select!` (see the doc
+    /// comment on `TcpConnection`).
     pub async fn recv(&mut self) -> Result<TypedMessage> {
         loop {
-            let stream = self.stream_mut()?;
-            let msg = read_frame(stream).await?;
+            let frame_result = {
+                let rx = self.frame_rx.as_mut().context("not connected")?;
+                rx.recv().await
+            };
+            let msg = match frame_result {
+                Some(result) => result?,
+                None => anyhow::bail!("connection closed"),
+            };
 
             if msg.base.refers_to != 0
                 && let Some(pending) = self.pending.remove(&msg.base.refers_to)
@@ -382,7 +443,7 @@ mod tests {
     #[test]
     fn tcp_connection_new() {
         let conn = TcpConnection::new("localhost", 1704);
-        assert!(conn.stream.is_none());
+        assert!(conn.write_half.is_none());
         assert_eq!(conn.host, "localhost");
         assert_eq!(conn.port, 1704);
     }
@@ -482,7 +543,7 @@ mod tests {
         conn.pending.insert(5, PendingRequest { tx });
         assert_eq!(conn.pending.len(), 1);
         conn.disconnect();
-        assert!(conn.stream.is_none());
+        assert!(conn.write_half.is_none());
         assert!(conn.pending.is_empty());
     }
 
