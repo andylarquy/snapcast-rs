@@ -10,7 +10,15 @@
 //! - macOS: `mach_continuous_time` (note: differs from `CLOCK_MONOTONIC` by
 //!   ~2 s, so the choice matters), scaled by `mach_timebase_info`.
 //! - Linux / other Unix: `CLOCK_MONOTONIC` via `clock_gettime`.
-//! - Non-Unix: falls back to wall-clock `SystemTime` (best effort).
+//! - Non-Unix (Windows): microseconds since this process started, via
+//!   `std::time::Instant` (backed by `QueryPerformanceCounter`). This MUST
+//!   be a genuinely monotonic, non-epoch clock like the Unix branches above -
+//!   an earlier version used wall-clock `SystemTime`, which meant a Windows
+//!   client's timestamps lived on a completely different numeric scale
+//!   (~1.7 billion seconds, i.e. the Unix epoch) than a Unix peer's
+//!   boot-relative `CLOCK_MONOTONIC` values. Mixing the two in the round-trip
+//!   calculation produced multi-year-scale garbage offsets - silent, per the
+//!   warning above, since nothing here type-checks the clock domain.
 
 /// Current monotonic time in microseconds.
 ///
@@ -63,11 +71,15 @@ fn monotonic_usec() -> i64 {
     }
     #[cfg(not(unix))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64
+        use std::sync::LazyLock;
+        use std::time::Instant;
+        // Arbitrary fixed reference point (process start), matching the
+        // "arbitrary but consistent" nature of Unix's CLOCK_MONOTONIC - the
+        // two peers' reference points don't need to agree with each other,
+        // only each side's own timestamps need to be self-consistent and
+        // free of any wall-clock/epoch component.
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        START.elapsed().as_micros() as i64
     }
 }
 
@@ -79,7 +91,12 @@ mod tests {
     fn now_usec_is_positive_and_monotonic() {
         let a = now_usec();
         let b = now_usec();
-        assert!(a > 0, "monotonic clock should be positive: {a}");
+        // >= 0, not > 0: on non-Unix this is time since process start (via
+        // Instant), which can legitimately read 0 on its very first call -
+        // unlike wall-clock time, which is always far above zero. Requiring
+        // strictly positive was really an unstated assumption baked in by
+        // the old (buggy) wall-clock-based Windows implementation.
+        assert!(a >= 0, "monotonic clock should be non-negative: {a}");
         assert!(b >= a, "monotonic clock must not go backwards: {a} -> {b}");
     }
 }
